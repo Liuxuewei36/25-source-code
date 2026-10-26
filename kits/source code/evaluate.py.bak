@@ -1,0 +1,404 @@
+# =============================================================================
+# evaluate.py — KiTS19 2.5D Baseline 评估 + 结果图生成
+# =============================================================================
+# 【文件职责】
+#   1. 加载 best_model.pth
+#   2. 在完整验证集上做推理
+#   3. 计算整体 kidney Dice / tumor Dice / mean Dice
+#      （严格版：累计全验证集 intersection/union，比 train.py 的 batch 均值更准确）
+#   4. 随机保存若干张分割结果图（image / gt / pred / overlay）
+#   5. 保存 eval_results.pt，供 visualize.py 直接使用
+#
+# 【与 train.py 的 Dice 计算区别】
+#   train.py val_one_epoch：每 batch 算 Dice 再平均   ← MVP 简化版，用于训练监控
+#   evaluate.py            ：累计全集 intersection/union 再统一计算 ← 严格版，用于最终汇报
+#   两者数值略有差异，以 evaluate.py 的结果为准。
+#
+# 【无后处理说明】
+#   当前不做任何后处理（如连通域分析、形态学操作）。
+#   标准做法（后续改进方向）：
+#     - 保留最大连通域（去除孤立噪点）
+#     - 形态学 closing（填充肿瘤内部空洞）
+#   当前 MVP 直接用 argmax 输出作为最终预测。
+# =============================================================================
+
+import os
+import sys
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from PIL import Image
+import matplotlib
+matplotlib.use("Agg")   # 非交互式后端，服务器环境不报错
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from kits import config
+from kits.dataset import get_dataloaders, KiTS25DDataset, get_case_list
+from kits.model import UNet2D
+from kits.utils import ensure_dirs, load_checkpoint
+from sklearn.model_selection import train_test_split
+
+
+# =============================================================================
+# 颜色定义（与 GT / Pred 可视化一致）
+# =============================================================================
+
+# 分割 mask 的伪彩色：0=背景(黑), 1=肾脏(蓝), 2=肿瘤(红)
+LABEL_COLORS = np.array([
+    [0,   0,   0  ],   # 0: 背景  — 黑色
+    [30,  144, 255],   # 1: 肾脏  — 蓝色 (DodgerBlue)
+    [255, 69,  0  ],   # 2: 肿瘤  — 红色 (OrangeRed)
+], dtype=np.uint8)     # shape: [3, 3]
+
+
+def label_to_rgb(mask: np.ndarray) -> np.ndarray:
+    """
+    将类别 mask 转为 RGB 伪彩色图，便于可视化。
+
+    参数：
+        mask: np.ndarray, shape [H, W], int, 值 ∈ {0, 1, 2}
+
+    返回：
+        np.ndarray, shape [H, W, 3], uint8
+    """
+    h, w  = mask.shape
+    rgb   = np.zeros((h, w, 3), dtype=np.uint8)
+    for cls_idx, color in enumerate(LABEL_COLORS):
+        rgb[mask == cls_idx] = color
+    return rgb
+
+
+# =============================================================================
+# 严格版 Dice 计算（累计全集 intersection / union）
+# =============================================================================
+
+def compute_dice_strict(
+    all_preds  : list[torch.Tensor],   # List of [H, W] int64
+    all_targets: list[torch.Tensor],   # List of [H, W] int64
+    num_classes: int = config.NUM_CLASSES,
+    smooth     : float = 1e-6,
+) -> list[float]:
+    """
+    严格版 Hard Dice：累计整个验证集的 intersection 和 union，统一计算。
+
+    【为什么比 batch 均值更准确】
+    batch 均值：每个 batch 算一个 Dice，再对 batch 取平均
+        → 小 batch 里如果碰巧没有肿瘤像素，该 batch 的 tumor dice = (smooth)/(smooth) ≈ 1
+        → 会虚高 tumor Dice
+    累计全集  ：在所有切片上统一累计 intersection 和 union，再计算一次
+        → 肿瘤像素极少时，分母更准确，不会被空 batch 稀释
+
+    返回：
+        List[float]，[dice_bg, dice_kidney, dice_tumor]
+    """
+    # 累计每类的 intersection 和 union（在 CPU 上算，不占 GPU 显存）
+    total_intersection = torch.zeros(num_classes)
+    total_union        = torch.zeros(num_classes)
+
+    for pred, target in zip(all_preds, all_targets):
+        for c in range(num_classes):
+            pred_c   = (pred   == c).float()
+            target_c = (target == c).float()
+            total_intersection[c] += (pred_c * target_c).sum()
+            total_union[c]        += pred_c.sum() + target_c.sum()
+
+    dice_list = []
+    for c in range(num_classes):
+        dice = (2.0 * total_intersection[c] + smooth) / (total_union[c] + smooth)
+        dice_list.append(dice.item())
+
+    return dice_list   # [dice_bg, dice_kidney, dice_tumor]
+
+
+# =============================================================================
+# 结果图：单张四格图（image / gt / pred / overlay）
+# =============================================================================
+
+def save_result_figure(
+    image   : np.ndarray,   # [H, W], float32, [0,1]，中心切片
+    gt_mask : np.ndarray,   # [H, W], int，GT 类别
+    pr_mask : np.ndarray,   # [H, W], int，Pred 类别
+    save_path: str,
+    title   : str = "",
+):
+    """
+    保存一张四格对比图：
+        左1：CT 灰度图（中心切片）
+        左2：GT mask 伪彩色
+        左3：Pred mask 伪彩色
+        左4：Overlay（CT 灰度 + Pred 半透明叠加）
+
+    参数：
+        image    : 中心切片灰度图，float32，[0,1]
+        gt_mask  : GT 类别 mask
+        pr_mask  : 预测类别 mask
+        save_path: 图片保存路径
+        title    : 图片标题（可包含 case 名、slice 编号、Dice 等）
+    """
+    gt_rgb   = label_to_rgb(gt_mask)    # [H, W, 3]
+    pred_rgb = label_to_rgb(pr_mask)    # [H, W, 3]
+
+    # Overlay：把 CT 灰度转成 RGB，再把非背景像素半透明叠上 pred 颜色
+    img_rgb  = np.stack([image * 255] * 3, axis=-1).astype(np.uint8)  # [H,W,3]
+    overlay  = img_rgb.copy()
+    fg_mask  = pr_mask > 0              # 前景像素（肾脏 or 肿瘤）
+    alpha    = 0.5
+    overlay[fg_mask] = (
+        (1 - alpha) * img_rgb[fg_mask] + alpha * pred_rgb[fg_mask]
+    ).astype(np.uint8)
+
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    fig.suptitle(title, fontsize=11)
+
+    axes[0].imshow(image, cmap="gray", vmin=0, vmax=1)
+    axes[0].set_title("CT Image (center slice)")
+
+    axes[1].imshow(gt_rgb)
+    axes[1].set_title("Ground Truth")
+
+    axes[2].imshow(pred_rgb)
+    axes[2].set_title("Prediction")
+
+    axes[3].imshow(overlay)
+    axes[3].set_title("Overlay (Pred)")
+
+    # 图例
+    legend_patches = [
+        mpatches.Patch(color=LABEL_COLORS[1] / 255., label="Kidney"),
+        mpatches.Patch(color=LABEL_COLORS[2] / 255., label="Tumor"),
+    ]
+    axes[3].legend(handles=legend_patches, loc="lower right", fontsize=8)
+
+    for ax in axes:
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+
+
+# =============================================================================
+# 主评估入口
+# =============================================================================
+
+def main(
+    n_save_good: int = 4,   # 保存几张"正常"结果图
+    n_save_hard: int = 2,   # 保存几张"困难样例"图（肿瘤 Dice 最低的几张）
+):
+    """
+    参数：
+        n_save_good : 从验证集随机抽取并保存的正常结果图数量
+        n_save_hard : 额外保存肿瘤 Dice 最低的几张（用于展示困难样例）
+    """
+    ensure_dirs(config.CHECKPOINT_DIR, config.FIGURE_DIR, config.LOG_DIR)
+    device = config.DEVICE
+
+    # --- 1. 重建验证集（与 train.py 使用相同 seed，保证 val case 一致）---
+    print("[eval] 重建验证集...")
+    all_cases = get_case_list(config.DATA_ROOT)
+    _, val_cases = train_test_split(
+        all_cases,
+        test_size    = config.VAL_RATIO,
+        random_state = config.SEED,
+        shuffle      = True,
+    )
+    val_dataset = KiTS25DDataset(val_cases)
+    val_loader  = DataLoader(
+        val_dataset,
+        batch_size  = config.BATCH_SIZE,
+        shuffle     = False,            # 评估时不打乱，方便对应 case/slice
+        num_workers = config.NUM_WORKERS,
+        pin_memory  = True,
+    )
+    print(f"[eval] 验证集: {len(val_cases)} cases, {len(val_dataset)} slices")
+
+    # --- 2. 加载模型 ---
+    print("[eval] 加载模型...")
+    model = UNet2D(
+        in_ch       = config.IN_CHANNELS,
+        num_classes = config.NUM_CLASSES,
+        base_ch     = config.BASE_CHANNELS,
+    ).to(device)
+
+    best_ckpt_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+    load_checkpoint(best_ckpt_path, model, device=device)
+    model.eval()
+
+    # --- 3. 推理：收集所有切片的 pred / gt / image ---
+    print("[eval] 推理中...")
+
+    # 用于 Dice 计算
+    all_preds   = []   # List of [H, W] int64 Tensor（CPU）
+    all_targets = []   # List of [H, W] int64 Tensor（CPU）
+
+    # 用于可视化（只存必要的，不把整个数据集放进内存）
+    # 每个元素：{"image": [H,W] float32, "gt": [H,W] int, "pred": [H,W] int,
+    #            "tumor_dice": float, "case_slice": str}
+    vis_records = []
+
+    with torch.no_grad():
+        for batch_idx, (x, y) in enumerate(tqdm(val_loader, desc="[eval] Inference")):
+            # x: [B, 3, H, W]  y: [B, H, W]
+            x_dev = x.to(device, non_blocking=True)
+            y_dev = y.to(device, non_blocking=True)
+
+            logits = model(x_dev)              # [B, C, H, W]
+            preds  = logits.argmax(dim=1)      # [B, H, W]
+
+            # 收集到 CPU（避免 GPU 显存堆积）
+            preds_cpu  = preds.cpu()           # [B, H, W]
+            targets_cpu = y.cpu()              # [B, H, W]
+
+            # 逐样本存入列表
+            for i in range(x.shape[0]):
+                all_preds.append(preds_cpu[i])
+                all_targets.append(targets_cpu[i])
+
+                # 计算该切片的单张 tumor Dice（用于筛选困难样例）
+                p = preds_cpu[i]
+                t = targets_cpu[i]
+                inter = ((p == 2) & (t == 2)).float().sum()
+                union = ((p == 2).float().sum() + (t == 2).float().sum())
+                tumor_dice_slice = (2 * inter + 1e-6) / (union + 1e-6)
+
+                # 取 x 的中心通道（通道 1）作为 CT 灰度图用于可视化
+                center_img = x[i, 1].cpu().numpy()   # [H, W], float32, [0,1]
+
+                # 全局 slice index → 用于标注标题
+                global_idx = batch_idx * config.BATCH_SIZE + i
+                case_dir, s, _ = val_dataset.index_table[
+                    min(global_idx, len(val_dataset) - 1)
+                ]
+                case_name  = os.path.basename(case_dir)
+                label_str  = f"{case_name}_s{s:03d}"
+
+                vis_records.append({
+                    "image"      : center_img,
+                    "gt"         : t.numpy().astype(np.int32),
+                    "pred"       : p.numpy().astype(np.int32),
+                    "tumor_dice" : tumor_dice_slice.item(),
+                    "label"      : label_str,
+                })
+
+    # --- 4. 严格版 Dice ---
+    print("[eval] 计算 Dice（严格版）...")
+    dice_list   = compute_dice_strict(all_preds, all_targets)
+    dice_bg     = dice_list[0]
+    dice_kidney = dice_list[1]
+    dice_tumor  = dice_list[2]
+    dice_mean   = (dice_kidney + dice_tumor) / 2.0
+
+    print("\n" + "=" * 50)
+    print("  KiTS19 2.5D Baseline — 评估结果")
+    print("=" * 50)
+    print(f"  Background Dice : {dice_bg:.4f}  （仅供参考）")
+    print(f"  Kidney Dice     : {dice_kidney:.4f}")
+    print(f"  Tumor  Dice     : {dice_tumor:.4f}")
+    print(f"  Mean Dice       : {dice_mean:.4f}  （前景类均值）")
+    print("=" * 50)
+
+    # --- 5. 保存结果图 ---
+    print(f"\n[eval] 保存结果图...")
+
+    # 5a. 随机抽取正常结果图（含前景像素的切片更有展示价值）
+    # 只从含有肾脏或肿瘤的切片里随机采样
+    foreground_records = [r for r in vis_records if r["gt"].max() > 0]
+    if len(foreground_records) == 0:
+        foreground_records = vis_records   # fallback：如果全是背景
+    sample_good = random.sample(
+        foreground_records,
+        min(n_save_good, len(foreground_records))
+    )
+    for rec in sample_good:
+        save_path = os.path.join(
+            config.FIGURE_DIR, f"result_{rec['label']}.png"
+        )
+        save_result_figure(
+            image    = rec["image"],
+            gt_mask  = rec["gt"],
+            pr_mask  = rec["pred"],
+            save_path= save_path,
+            title    = (f"{rec['label']} | "
+                        f"Tumor Dice={rec['tumor_dice']:.3f}"),
+        )
+        print(f"  保存: {os.path.basename(save_path)}")
+
+    # 5b. 困难样例：tumor Dice 最低的几张
+    # 只从 GT 中含肿瘤（类别 2）的切片里找最低的
+    tumor_records = [r for r in vis_records if (r["gt"] == 2).any()]
+    if len(tumor_records) > 0:
+        hard_records = sorted(tumor_records, key=lambda r: r["tumor_dice"])
+        hard_records = hard_records[:n_save_hard]
+        for rec in hard_records:
+            save_path = os.path.join(
+                config.FIGURE_DIR, f"hard_case_{rec['label']}.png"
+            )
+            save_result_figure(
+                image    = rec["image"],
+                gt_mask  = rec["gt"],
+                pr_mask  = rec["pred"],
+                save_path= save_path,
+                title    = (f"[Hard Case] {rec['label']} | "
+                            f"Tumor Dice={rec['tumor_dice']:.3f}"),
+            )
+            print(f"  保存困难样例: {os.path.basename(save_path)}")
+    else:
+        print("  [eval] 验证集中未找到含肿瘤切片，跳过困难样例保存。")
+
+    # --- 6. 保存 eval_results.pt（供 visualize.py 使用）---
+    # 只存必要字段，不存整个 dataset
+    eval_results = {
+        # 整体指标
+        "dice_bg"     : dice_bg,
+        "dice_kidney" : dice_kidney,
+        "dice_tumor"  : dice_tumor,
+        "dice_mean"   : dice_mean,
+
+        # 可视化用的记录（image/gt/pred 已转为 numpy，不含 Tensor）
+        # 为控制文件大小，只保存含前景的切片，最多 200 条
+        "vis_records" : foreground_records[:200],
+
+        # 元信息
+        "num_val_cases" : len(val_cases),
+        "num_val_slices": len(val_dataset),
+        "img_size"      : config.IMG_SIZE,
+        "num_classes"   : config.NUM_CLASSES,
+    }
+
+    results_path = config.EVAL_RESULTS_PATH
+    torch.save(eval_results, results_path)
+    print(f"\n[eval] eval_results.pt 已保存: {results_path}")
+
+    # --- 7. 汇总 ---
+    print("\n[eval] 所有输出文件：")
+    print(f"  结果图目录   : {config.FIGURE_DIR}")
+    print(f"  eval_results : {results_path}")
+    print("\n[eval] 完成。")
+
+    return eval_results   # 方便其他脚本 import 后直接调用
+
+
+# =============================================================================
+# 入口
+# =============================================================================
+
+# evaluate.py 末尾改成这样，支持命令行传入 checkpoint 路径
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="best_model.pth",
+                        help="checkpoint 文件名（在 CHECKPOINT_DIR 下）")
+    args = parser.parse_args()
+
+    # 把原来 main() 里这一行
+    # best_ckpt_path = os.path.join(config.CHECKPOINT_DIR, "best_model.pth")
+    # 改成：
+    ckpt_path = os.path.join(config.CHECKPOINT_DIR, args.ckpt)
+    # 然后 load_checkpoint(ckpt_path, model, ...) 用这个路径
+    main(ckpt_override=ckpt_path)

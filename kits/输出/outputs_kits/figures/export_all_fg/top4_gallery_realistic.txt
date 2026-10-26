@@ -1,0 +1,4 @@
+1. case_00092_s024 | Kidney Dice=0.921 | Tumor Dice=0.879 | Mean Dice=0.900 | outputs_kits/figures/export_all_fg/case_00092/case_00092_s024.png
+2. case_00096_s412 | Kidney Dice=0.912 | Tumor Dice=0.888 | Mean Dice=0.900 | outputs_kits/figures/export_all_fg/case_00096/case_00096_s412.png
+3. case_00070_s032 | Kidney Dice=0.858 | Tumor Dice=0.942 | Mean Dice=0.900 | outputs_kits/figures/export_all_fg/case_00070/case_00070_s032.png
+4. case_00005_s293 | Kidney Dice=0.871 | Tumor Dice=0.929 | Mean Dice=0.900 | outputs_kits/figures/export_all_fg/case_00005/case_00005_s293.png

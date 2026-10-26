@@ -1,0 +1,16 @@
+# macOS filesystem metadata
+.DS_Store
+._*
+.Spotlight-V100/
+.Trashes/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local credentials
+.env
+.env.*
+!.env.example

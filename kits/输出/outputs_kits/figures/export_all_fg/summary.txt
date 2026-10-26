@@ -1,0 +1,10 @@
+split=all
+num_cases=210
+num_slices=45424
+saved_figures=17731
+dice_bg=0.999386
+dice_kidney=0.775409
+dice_tumor=0.859682
+dice_mean=0.817545
+rank_by=mean_dice
+only_fg=1
